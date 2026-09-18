@@ -1,7 +1,9 @@
 import asyncio
 import contextlib
+import copy
 import logging
-from collections import Counter, namedtuple
+import time
+from collections import Counter, OrderedDict, namedtuple
 from collections.abc import Iterable
 from itertools import chain
 from typing import Any, Dict, List, Optional, Union, cast
@@ -331,42 +333,55 @@ class BaguetteHelp(commands.RedHelpFormatter):
         else:
             await ctx.send(_("You need to enable embeds to use the help menu"))
 
+    async def _build_bot_help(self, ctx: Context, help_settings: HelpSettings):
+        """The expensive half: every category, every command, every `can_run`."""
+        emb = await self.embed_template(help_settings, ctx, ctx.bot.description)
+        filtered_categories = await self.filter_categories(ctx, GLOBAL_CATEGORIES)
+
+        page_raw_str_data = []
+        page_mapping = {}
+        for cat in filtered_categories:
+            if cat.cogs:
+                if not await get_category_page_mapper_chunk(
+                    self, False, ctx, cat, help_settings, page_mapping
+                ):
+                    continue
+
+                page_raw_str_data.append(
+                    f"{str(cat.reaction) if cat.reaction else ''} `{ctx.clean_prefix}help {cat.name:<10}:`**{cat.desc}**\n"
+                )
+
+        for i in pagify("\n".join(page_raw_str_data), page_length=1018):
+            emb["fields"].append(EmbedField("Categories:", i, False))
+
+        pages = await self.make_embeds(ctx, emb, help_settings=help_settings)
+        return pages, page_mapping
+
     async def format_bot_help(
         self, ctx: Context, help_settings: HelpSettings, get_pages: bool = False
     ):
-        if await ctx.embed_requested():
-            emb = await self.embed_template(help_settings, ctx, ctx.bot.description)
-            filtered_categories = await self.filter_categories(ctx, GLOBAL_CATEGORIES)
-
-            page_raw_str_data = []
-            page_mapping = {}
-            for cat in filtered_categories:
-                if cat.cogs:
-                    if not await get_category_page_mapper_chunk(
-                        self, False, ctx, cat, help_settings, page_mapping
-                    ):
-                        continue
-
-                    page_raw_str_data.append(
-                        f"{str(cat.reaction) if cat.reaction else ''} `{ctx.clean_prefix}help {cat.name:<10}:`**{cat.desc}**\n"
-                    )
-
-            for i in pagify("\n".join(page_raw_str_data), page_length=1018):
-                emb["fields"].append(EmbedField("Categories:", i, False))
-
-            pages = await self.make_embeds(ctx, emb, help_settings=help_settings)
-            if get_pages:
-                return pages
-            else:
-                await self.send_pages(
-                    ctx,
-                    pages,
-                    embed=True,
-                    help_settings=help_settings,
-                    page_mapping=page_mapping,
-                )
-        else:
+        if not await ctx.embed_requested():
             await ctx.send(_("You need to enable embeds to use the help menu"))
+            return
+
+        key = help_cache_key(ctx)
+        built = help_cache_get(key)
+        if built is None:
+            pages, page_mapping = await self._build_bot_help(ctx, help_settings)
+            help_cache_put(key, pages, page_mapping)
+            # Read back out so a hit and a miss hand over identical, unshared data.
+            built = help_cache_get(key) or (pages, page_mapping)
+        pages, page_mapping = built
+
+        if get_pages:
+            return pages
+        await self.send_pages(
+            ctx,
+            pages,
+            embed=True,
+            help_settings=help_settings,
+            page_mapping=page_mapping,
+        )
 
     # util to reduce code dupes
     async def embed_template(self, help_settings, ctx, description=None):
@@ -540,6 +555,64 @@ class BaguetteHelp(commands.RedHelpFormatter):
             ) and (is_owner or name not in blocklist["dev"]):
                 final.append(name)
         return final
+
+
+# A full help build filters every command on the bot through `can_run`, which on
+# a large bot is hundreds of permission evaluations and seconds of event loop.
+# The result only varies by who is asking and where, so it is cached on exactly
+# that. `_CACHE_TTL` bounds how stale a `helpset` change may read.
+_CACHE_TTL = 60.0
+_CACHE_MAX = 256
+_help_cache: "OrderedDict[tuple, tuple]" = OrderedDict()
+
+
+def help_cache_key(ctx) -> tuple:
+    """Everything the rendered pages can vary on, and nothing else.
+
+    `permissions_for` already folds in channel overwrites, but role ids are kept
+    separately because Red's admin/mod checks look at roles, not permissions.
+    The two counts stand in for "a cog was loaded or unloaded".
+    """
+    author = ctx.author
+    try:
+        perms = ctx.channel.permissions_for(author).value
+    except (AttributeError, TypeError):
+        perms = 0
+    return (
+        getattr(ctx.guild, "id", 0),
+        getattr(ctx.channel, "id", 0),
+        perms,
+        tuple(sorted(r.id for r in getattr(author, "roles", ()))),
+        author.id in ctx.bot.owner_ids,
+        ctx.clean_prefix,
+        len(ctx.bot.cogs),
+        len(ctx.bot.all_commands),
+    )
+
+
+def help_cache_get(key):
+    entry = _help_cache.get(key)
+    if entry is None:
+        return None
+    stored_at, payload = entry
+    if time.monotonic() - stored_at > _CACHE_TTL:
+        del _help_cache[key]
+        return None
+    _help_cache.move_to_end(key)
+    # Copied out: the menu mutates its mapping, and embeds are handed to views.
+    pages, mapping = payload
+    return copy.deepcopy(pages), {k: copy.deepcopy(v) for k, v in mapping.items()}
+
+
+def help_cache_put(key, pages, mapping):
+    _help_cache[key] = (time.monotonic(), (pages, mapping))
+    _help_cache.move_to_end(key)
+    while len(_help_cache) > _CACHE_MAX:
+        _help_cache.popitem(last=False)
+
+
+def help_cache_clear():
+    _help_cache.clear()
 
 
 class HybridMenus:
