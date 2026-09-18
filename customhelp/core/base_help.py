@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import logging
 from collections import Counter, namedtuple
 from collections.abc import Iterable
@@ -579,8 +580,34 @@ class HybridMenus:
         data = self._get_kwargs_from_page(self.pages[self.curr_page])
         if isinstance(interaction, discord.Message):
             await interaction.edit(**data, **kwargs)
-        else:
-            await interaction.response.edit_message(**data, **kwargs)
+            return
+        # Discord kills an interaction 3s after the click. `edit_message` was the
+        # only ack, so any loop congestion at all showed as "interaction failed".
+        # Deferring first buys 15 minutes; on a component it is silent, and the
+        # message is left untouched until the edit below lands.
+        if not interaction.response.is_done():
+            await interaction.response.defer()
+        await interaction.edit_original_response(**data, **kwargs)
+
+    async def goto_page(self, interaction, page):
+        """Move to `page`, putting `curr_page` back if the edit never lands.
+
+        Without the rollback a failed edit desynced the menu from the screen:
+        the counter had already moved, so the next click skipped a page.
+        """
+        previous = self.curr_page
+        self.curr_page = page
+        try:
+            await self.show_current_page(interaction)
+        except discord.HTTPException:
+            self.curr_page = previous
+            LOG.warning(
+                "customhelp: page %s -> %s did not land; menu left on %s",
+                previous,
+                page,
+                previous,
+                exc_info=True,
+            )
 
     async def start(self, ctx):
         await self.create_menutype()
@@ -766,6 +793,10 @@ class HybridMenus:
     async def category_react_action(
         self, user_ctx: commands.Context, interaction, category_name: str
     ):
+        # Same reason as `home_page`: the page build below is the slow part, and
+        # it used to run entirely inside the 3s window.
+        if isinstance(interaction, discord.Interaction) and not interaction.response.is_done():
+            await interaction.response.defer()
         if category_pages := await self.get_pages(user_ctx, category_name):
             self.change_source(category_pages)
 
@@ -791,10 +822,7 @@ class HybridMenus:
                     sender_ctx = self.menus[1].ctx
                     bot_message = self.menus[1].message
 
-                    # This is needed for the interaction to not failed,
-                    # when the category is a button
-                    if type(interaction) == discord.Interaction:
-                        await interaction.response.defer()
+                    # Already deferred at the top of this method.
 
                     self.menus[1].clear_items()
 
@@ -810,31 +838,32 @@ class HybridMenus:
                 await self.show_current_page(interaction)
 
     async def home_page(self, ctx, interaction):
+        # Deferred before `get_pages`, which can rebuild every category page and
+        # is easily the slowest thing on this path.
+        if isinstance(interaction, discord.Interaction) and not interaction.response.is_done():
+            await interaction.response.defer()
         self.change_source(await self.get_pages(ctx, "home"))
         await self.show_current_page(interaction)
 
     async def first_page(self, interaction):
-        self.curr_page = 0
-        await self.show_current_page(interaction)
+        await self.goto_page(interaction, 0)
 
     async def last_page(self, interaction):
-        self.curr_page = len(self.pages) - 1
-        await self.show_current_page(interaction)
+        await self.goto_page(interaction, len(self.pages) - 1)
 
     async def next_page(self, interaction):
-        if self.curr_page < len(self.pages) - 1:
-            self.curr_page += 1
-            await self.show_current_page(interaction)
-        else:
-            await self.first_page(interaction)
+        # Wrap-around kept exactly as it was: past the end is the first page.
+        last = len(self.pages) - 1
+        await self.goto_page(interaction, self.curr_page + 1 if self.curr_page < last else 0)
 
     async def prev_page(self, interaction):
-        if self.curr_page > 0:
-            self.curr_page -= 1
-            await self.show_current_page(interaction)
-        else:
-            await self.last_page(interaction)
+        last = len(self.pages) - 1
+        await self.goto_page(interaction, self.curr_page - 1 if self.curr_page > 0 else last)
 
     async def close_menu(self, interaction):
         self.stop()
-        await self.bot_message.delete()
+        # Acked before the delete, so a slow delete cannot orphan the interaction.
+        if not interaction.response.is_done():
+            await interaction.response.defer()
+        with contextlib.suppress(discord.HTTPException):
+            await self.bot_message.delete()
