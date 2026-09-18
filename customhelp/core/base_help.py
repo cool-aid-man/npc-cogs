@@ -170,6 +170,25 @@ class BaguetteHelp(commands.RedHelpFormatter):
         else:
             await self.format_command_help(ctx, help_for, help_settings=help_settings)
 
+    async def get_cog_help_mapping(
+        self, ctx: Context, obj: commands.Cog, help_settings: HelpSettings
+    ):
+        """Red's, but memoised.
+
+        Every help form - bare, category, cog - reaches `can_run` through here,
+        so one cache covers all of them. Only the filtering is cached; the embeds
+        are rebuilt each time, which is string work and cheap next to hundreds of
+        permission evaluations.
+        """
+        key = help_cache_key(ctx, ("cog", obj.qualified_name))
+        mapping = filter_cache_get(key)
+        if mapping is None:
+            mapping = await super().get_cog_help_mapping(
+                ctx, obj, help_settings=help_settings
+            )
+            filter_cache_put(key, mapping)
+        return mapping
+
     async def format_category_help(
         self,
         ctx: Context,
@@ -562,11 +581,16 @@ class BaguetteHelp(commands.RedHelpFormatter):
 # The result only varies by who is asking and where, so it is cached on exactly
 # that. `_CACHE_TTL` bounds how stale a `helpset` change may read.
 _CACHE_TTL = 60.0
-_CACHE_MAX = 256
+# Entry counts, not bytes. A page entry is one viewer's rendered embeds; a filter
+# entry is one viewer's allowed commands for one cog, so there are far more of
+# those and they are far smaller.
+_PAGE_CACHE_MAX = 256
+_FILTER_CACHE_MAX = 2048
 _help_cache: "OrderedDict[tuple, tuple]" = OrderedDict()
+_filter_cache: "OrderedDict[tuple, dict]" = OrderedDict()
 
 
-def help_cache_key(ctx) -> tuple:
+def help_cache_key(ctx, what="bot") -> tuple:
     """Everything the rendered pages can vary on, and nothing else.
 
     `permissions_for` already folds in channel overwrites, but role ids are kept
@@ -587,32 +611,55 @@ def help_cache_key(ctx) -> tuple:
         ctx.clean_prefix,
         len(ctx.bot.cogs),
         len(ctx.bot.all_commands),
+        what,
     )
 
 
-def help_cache_get(key):
-    entry = _help_cache.get(key)
+def _cache_get(store, key, limit):
+    entry = store.get(key)
     if entry is None:
         return None
     stored_at, payload = entry
     if time.monotonic() - stored_at > _CACHE_TTL:
-        del _help_cache[key]
+        del store[key]
         return None
-    _help_cache.move_to_end(key)
+    store.move_to_end(key)
+    return payload
+
+
+def _cache_put(store, key, payload, limit):
+    store[key] = (time.monotonic(), payload)
+    store.move_to_end(key)
+    while len(store) > limit:
+        store.popitem(last=False)
+
+
+def help_cache_get(key):
+    payload = _cache_get(_help_cache, key, _PAGE_CACHE_MAX)
+    if payload is None:
+        return None
     # Copied out: the menu mutates its mapping, and embeds are handed to views.
     pages, mapping = payload
     return copy.deepcopy(pages), {k: copy.deepcopy(v) for k, v in mapping.items()}
 
 
 def help_cache_put(key, pages, mapping):
-    _help_cache[key] = (time.monotonic(), (pages, mapping))
-    _help_cache.move_to_end(key)
-    while len(_help_cache) > _CACHE_MAX:
-        _help_cache.popitem(last=False)
+    _cache_put(_help_cache, key, (pages, mapping), _PAGE_CACHE_MAX)
+
+
+def filter_cache_get(key):
+    payload = _cache_get(_filter_cache, key, _FILTER_CACHE_MAX)
+    # Shallow: the values are the bot's own Command objects, shared by design.
+    return None if payload is None else dict(payload)
+
+
+def filter_cache_put(key, mapping):
+    _cache_put(_filter_cache, key, dict(mapping), _FILTER_CACHE_MAX)
 
 
 def help_cache_clear():
     _help_cache.clear()
+    _filter_cache.clear()
 
 
 class HybridMenus:
